@@ -1,50 +1,3 @@
-// Add this helper function near the top of index.js
-async function sendWebhook(data) {
-  if (!process.env.WEBHOOK_URL) return;
-  try {
-    await fetch(process.env.WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-webhook-secret': process.env.WEBHOOK_SECRET || ''
-      },
-      body: JSON.stringify(data)
-    });
-  } catch (e) {
-    console.log('Webhook failed:', e.message);
-  }
-}
-
-// Then in your client event handlers:
-
-client.on('ready', async () => {
-  const info = client.info;
-  await sendWebhook({
-    event: 'status_change',
-    session: 'marhaba',  // match your session_name in the app
-    status: 'connected',
-    user: { phone: info?.wid?.user, name: info?.pushname }
-  });
-});
-
-client.on('disconnected', async () => {
-  await sendWebhook({
-    event: 'status_change',
-    session: 'marhaba',
-    status: 'disconnected'
-  });
-});
-
-client.on('qr', async () => {
-  await sendWebhook({
-    event: 'status_change',
-    session: 'marhaba',
-    status: 'linking'
-  });
-});
-
-// end of this code
-
 const express = require("express");
 const cors = require("cors");
 const { Client, LocalAuth } = require("whatsapp-web.js");
@@ -107,6 +60,53 @@ client.on("auth_failure", (msg) => {
   console.error("Authentication failed:", msg);
   clientReady = false;
 });
+
+// Add this helper function near the top of index.js
+async function sendWebhook(data) {
+  if (!process.env.WEBHOOK_URL) return;
+  try {
+    await fetch(process.env.WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-webhook-secret': process.env.WEBHOOK_SECRET || ''
+      },
+      body: JSON.stringify(data)
+    });
+  } catch (e) {
+    console.log('Webhook failed:', e.message);
+  }
+}
+
+// Then in your client event handlers:
+
+client.on('ready', async () => {
+  const info = client.info;
+  await sendWebhook({
+    event: 'status_change',
+    session: 'marhaba',  // match your session_name in the app
+    status: 'connected',
+    user: { phone: info?.wid?.user, name: info?.pushname }
+  });
+});
+
+client.on('disconnected', async () => {
+  await sendWebhook({
+    event: 'status_change',
+    session: 'marhaba',
+    status: 'disconnected'
+  });
+});
+
+client.on('qr', async () => {
+  await sendWebhook({
+    event: 'status_change',
+    session: 'marhaba',
+    status: 'linking'
+  });
+});
+
+// end of this code
 
 client.initialize();
 
