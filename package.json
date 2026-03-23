@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "express": "^4.21.0",
-    "whatsapp-web.js": "^1.26.0",
+    "whatsapp-web.js": "github:nicollassilva/nicollassilva-whatsapp-web.js",
     "qrcode": "^1.5.4",
     "cors": "^2.8.5"
   }
