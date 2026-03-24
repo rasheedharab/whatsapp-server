@@ -1,8 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
+const { Client, LocalAuth } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
-const pino = require("pino");
 
 const app = express();
 app.use(cors());
@@ -10,7 +9,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "";
-const SESSION_DIR = process.env.SESSION_DIR || "./auth_session";
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 
 // ─── Auth middleware ───
 function auth(req, res, next) {
@@ -21,118 +20,105 @@ function auth(req, res, next) {
 }
 app.use(auth);
 
-// ─── Baileys state ───
-let sock = null;
+// ─── Webhook helper ───
+async function sendWebhook(payload) {
+  if (!WEBHOOK_URL) return;
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_KEY ? { "x-webhook-secret": API_KEY } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error("Webhook delivery failed:", err.message);
+  }
+}
+
+// ─── WhatsApp client ───
 let qrData = null;
 let clientReady = false;
 let clientInfo = null;
-let contactStore = {};   // jid -> { name, notify, ... }
-let groupCache = {};     // jid -> group metadata
 
-async function startSocket() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+const client = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+  },
+});
 
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: true,
-    logger: pino({ level: "warn" }),
-    browser: ["WhatsApp Server", "Chrome", "1.0.0"],
-    generateHighQualityLinkPreview: false,
+client.on("qr", (qr) => {
+  qrData = qr;
+  clientReady = false;
+  console.log("QR code received. Scan it from the /qr endpoint.");
+  sendWebhook({ event: "qr", session: process.env.SESSION_NAME || "default" });
+});
+
+client.on("ready", () => {
+  qrData = null;
+  clientReady = true;
+  clientInfo = client.info;
+  console.log("WhatsApp client is ready!", client.info.pushname);
+  sendWebhook({
+    event: "ready",
+    session: process.env.SESSION_NAME || "default",
+    user: { name: clientInfo.pushname, phone: clientInfo.wid.user },
   });
+});
 
-  // Save credentials on update
-  sock.ev.on("creds.update", saveCreds);
+client.on("disconnected", (reason) => {
+  clientReady = false;
+  clientInfo = null;
+  console.log("Client disconnected:", reason);
+  sendWebhook({ event: "disconnected", session: process.env.SESSION_NAME || "default" });
+  setTimeout(() => client.initialize(), 5000);
+});
 
-  // QR code
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+client.on("auth_failure", (msg) => {
+  console.error("Authentication failed:", msg);
+  clientReady = false;
+  sendWebhook({ event: "auth_failure", session: process.env.SESSION_NAME || "default" });
+});
 
-    if (qr) {
-      qrData = qr;
-      clientReady = false;
-      console.log("QR code received. Scan from /qr endpoint.");
-    }
-
-    if (connection === "open") {
-      qrData = null;
-      clientReady = true;
-      clientInfo = {
-        pushname: sock.user?.name || "Unknown",
-        wid: sock.user?.id?.split(":")[0] || "",
-      };
-      console.log("WhatsApp connected!", clientInfo.pushname);
-    }
-
-    if (connection === "close") {
-      clientReady = false;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log("Connection closed. Status:", statusCode, "Reconnecting:", shouldReconnect);
-      if (shouldReconnect) {
-        setTimeout(startSocket, 3000);
-      } else {
-        console.log("Logged out. Delete session folder and restart to re-link.");
-      }
-    }
+// ─── Forward incoming messages via webhook ───
+client.on("message", async (msg) => {
+  sendWebhook({
+    event: "message_received",
+    session: process.env.SESSION_NAME || "default",
+    message: {
+      wa_message_id: msg.id._serialized,
+      chat_id: msg.from,
+      body: msg.body,
+      sender: msg._data?.notifyName || "",
+      sender_jid: msg.author || msg.from,
+      timestamp: msg.timestamp,
+      fromMe: msg.fromMe,
+      hasMedia: msg.hasMedia,
+      type: msg.type,
+    },
   });
+});
 
-  // ─── Contact store: capture contacts pushed by WhatsApp ───
-  sock.ev.on("contacts.upsert", (contacts) => {
-    for (const c of contacts) {
-      contactStore[c.id] = { ...contactStore[c.id], ...c };
-    }
-    console.log(`Contacts upserted: ${contacts.length} (total: ${Object.keys(contactStore).length})`);
-  });
-
-  sock.ev.on("contacts.update", (updates) => {
-    for (const u of updates) {
-      if (contactStore[u.id]) {
-        contactStore[u.id] = { ...contactStore[u.id], ...u };
-      } else {
-        contactStore[u.id] = u;
-      }
-    }
-  });
-
-  // ─── Group metadata cache ───
-  sock.ev.on("groups.upsert", (groups) => {
-    for (const g of groups) {
-      groupCache[g.id] = g;
-    }
-  });
-
-  sock.ev.on("groups.update", (updates) => {
-    for (const u of updates) {
-      if (groupCache[u.id]) {
-        groupCache[u.id] = { ...groupCache[u.id], ...u };
-      }
-    }
-  });
-}
-
-startSocket();
-
-// ─── Helper ───
-function ensureReady(req, res) {
-  if (!clientReady || !sock) {
-    res.status(503).json({ error: "Client not ready" });
-    return false;
-  }
-  return true;
-}
+client.initialize();
 
 // ─── Routes ───
 
+// Health / status check
 app.get("/status", (req, res) => {
   res.json({
     connected: clientReady,
-    user: clientInfo ? { name: clientInfo.pushname, phone: clientInfo.wid } : null,
+    user: clientInfo
+      ? { name: clientInfo.pushname, phone: clientInfo.wid.user }
+      : null,
     qrPending: !!qrData,
   });
 });
 
+// QR code as base64 image
 app.get("/qr", async (req, res) => {
   if (clientReady) return res.json({ status: "already_connected" });
   if (!qrData) return res.json({ status: "waiting_for_qr", qr: null });
@@ -144,50 +130,179 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// ─── CONTACTS: returns individual contacts from the Baileys store ───
+// Get all contacts
 app.get("/contacts", async (req, res) => {
-  if (!ensureReady(req, res)) return;
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
   try {
-    const contacts = Object.values(contactStore)
-      .filter((c) => {
-        // Only individual contacts (not groups, not status broadcast)
-        const id = c.id || "";
-        return id.endsWith("@s.whatsapp.net") && !id.startsWith("status");
-      })
+    const contacts = await client.getContacts();
+    const mapped = contacts
+      .filter((c) => c.id.server === "c.us" && c.isMyContact)
       .map((c) => ({
-        wa_id: c.id,
-        name: c.name || c.notify || c.verifiedName || null,
-        phone: (c.id || "").replace("@s.whatsapp.net", ""),
-        is_business: !!c.verifiedName,
+        wa_id: c.id._serialized,
+        name: c.name || c.pushname || c.number,
+        phone: c.number,
+        is_business: c.isBusiness,
         profile_pic_url: null,
       }));
-
-    console.log(`Returning ${contacts.length} contacts`);
-    res.json(contacts);
+    res.json(mapped);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GROUPS ───
+// Get all groups
 app.get("/groups", async (req, res) => {
-  if (!ensureReady(req, res)) return;
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
   try {
-    // Fetch all groups the user participates in
-    const groups = await sock.groupFetchAllParticipating();
-    const mapped = Object.values(groups).map((g) => ({
-      wa_id: g.id,
-      name: g.subject || "Unknown Group",
-      description: g.desc || "",
-      member_count: g.participants?.length || 0,
-      members: (g.participants || []).map((p) => ({
-        id: p.id,
-        isAdmin: p.admin === "admin" || p.admin === "superadmin",
-      })),
-      admins: (g.participants || [])
-        .filter((p) => p.admin === "admin" || p.admin === "superadmin")
-        .map((p) => p.id),
-      profile_pic_url: null,
+    const chats = await client.getChats();
+    const groups = chats.filter((c) => c.isGroup);
+    const mapped = await Promise.all(
+      groups.map(async (g) => {
+        const metadata = await g.groupMetadata?.() || {};
+        return {
+          wa_id: g.id._serialized,
+          name: g.name,
+          description: metadata.desc || "",
+          member_count: metadata.participants?.length || 0,
+          members: (metadata.participants || []).map((p) => ({
+            id: p.id._serialized,
+            isAdmin: p.isAdmin || p.isSuperAdmin,
+          })),
+          admins: (metadata.participants || [])
+            .filter((p) => p.isAdmin || p.isSuperAdmin)
+            .map((p) => p.id._serialized),
+        };
+      })
+    );
+    res.json(mapped);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get group participants
+app.get("/groups/:groupId/participants", async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
+  try {
+    const groupId = decodeURIComponent(req.params.groupId);
+    const chat = await client.getChatById(groupId);
+    if (!chat.isGroup) return res.status(400).json({ error: "Not a group chat" });
+    const metadata = await chat.groupMetadata?.() || {};
+    const participants = (metadata.participants || []).map((p) => ({
+      id: p.id._serialized,
+      name: p.pushname || p.name || null,
+      isAdmin: p.isAdmin || p.isSuperAdmin || false,
+    }));
+    res.json({ participants });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PAGINATED message history ───
+// GET /messages/:chatId?limit=50&before=<timestamp>
+// - limit: number of messages to fetch (default 50, max 500)
+// - before: unix timestamp — only return messages older than this (for pagination)
+app.get("/messages/:chatId", async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
+  try {
+    const chatId = decodeURIComponent(req.params.chatId);
+    const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+    const beforeTs = req.query.before ? parseInt(req.query.before) : null;
+
+    const chat = await client.getChatById(chatId);
+
+    // Fetch more than needed so we can filter by timestamp
+    const fetchCount = beforeTs ? limit + 100 : limit;
+    const messages = await chat.fetchMessages({ limit: fetchCount });
+
+    let filtered = messages;
+    if (beforeTs) {
+      filtered = messages.filter((m) => m.timestamp < beforeTs);
+    }
+
+    // Take only the requested limit (last N messages)
+    const sliced = filtered.slice(-limit);
+
+    const mapped = sliced.map((m) => ({
+      wa_message_id: m.id._serialized,
+      id: m.id._serialized,
+      from: m.from,
+      to: m.to,
+      body: m.body,
+      timestamp: m.timestamp,
+      fromMe: m.fromMe,
+      is_from_me: m.fromMe,
+      sender: m._data?.notifyName || "",
+      hasMedia: m.hasMedia,
+      type: m.type,
+    }));
+
+    res.json({
+      messages: mapped,
+      has_more: filtered.length > sliced.length,
+      oldest_timestamp: mapped.length > 0 ? mapped[0].timestamp : null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send a message
+app.post("/send", async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
+  try {
+    const { chatId, message } = req.body;
+    if (!chatId || !message) {
+      return res.status(400).json({ error: "chatId and message are required" });
+    }
+    const result = await client.sendMessage(chatId, message);
+    res.json({
+      success: true,
+      wa_message_id: result.id._serialized,
+      timestamp: result.timestamp,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send WhatsApp status (text)
+app.post("/send-status", async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
+  try {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: "message is required" });
+    const result = await client.sendMessage("status@broadcast", message);
+    res.json({
+      success: true,
+      wa_message_id: result.id._serialized,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all chats (for conversations page)
+app.get("/chats", async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
+  try {
+    const chats = await client.getChats();
+    const mapped = chats.slice(0, 100).map((c) => ({
+      wa_id: c.id._serialized,
+      name: c.name,
+      is_group: c.isGroup,
+      unread_count: c.unreadCount,
+      last_message: c.lastMessage
+        ? {
+            body: c.lastMessage.body,
+            timestamp: c.lastMessage.timestamp,
+            fromMe: c.lastMessage.fromMe,
+            is_from_me: c.lastMessage.fromMe,
+            sender: c.lastMessage._data?.notifyName || "",
+          }
+        : null,
+      timestamp: c.timestamp,
     }));
     res.json(mapped);
   } catch (err) {
@@ -195,103 +310,11 @@ app.get("/groups", async (req, res) => {
   }
 });
 
-// ─── CHATS: returns recent conversations ───
-app.get("/chats", async (req, res) => {
-  if (!ensureReady(req, res)) return;
-  try {
-    // Baileys doesn't have a built-in chat list like whatsapp-web.js.
-    // We build it from contacts + groups that have been seen.
-    const chats = [];
-
-    // Add groups
-    try {
-      const groups = await sock.groupFetchAllParticipating();
-      for (const g of Object.values(groups)) {
-        chats.push({
-          wa_id: g.id,
-          name: g.subject || "Unknown Group",
-          is_group: true,
-          unread_count: 0,
-          last_message: null,
-          timestamp: g.subjectTime || 0,
-        });
-      }
-    } catch (e) {
-      console.warn("Failed to fetch groups for chats:", e.message);
-    }
-
-    // Add individual contacts from store
-    for (const c of Object.values(contactStore)) {
-      const id = c.id || "";
-      if (!id.endsWith("@s.whatsapp.net") || id.startsWith("status")) continue;
-      chats.push({
-        wa_id: id,
-        name: c.name || c.notify || c.verifiedName || id.replace("@s.whatsapp.net", ""),
-        is_group: false,
-        unread_count: 0,
-        last_message: null,
-        timestamp: 0,
-      });
-    }
-
-    res.json(chats);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── MESSAGES ───
-app.get("/messages/:chatId", async (req, res) => {
-  if (!ensureReady(req, res)) return;
-  // Baileys does not store message history by default.
-  // Return empty — the dashboard uses its own message_log DB.
-  res.json([]);
-});
-
-// ─── SEND MESSAGE ───
-app.post("/send", async (req, res) => {
-  if (!ensureReady(req, res)) return;
-  try {
-    const { chatId, message } = req.body;
-    if (!chatId || !message) {
-      return res.status(400).json({ error: "chatId and message are required" });
-    }
-    const result = await sock.sendMessage(chatId, { text: message });
-    res.json({
-      success: true,
-      wa_message_id: result.key.id,
-      timestamp: Math.floor(Date.now() / 1000),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── SEND STATUS ───
-app.post("/send-status", async (req, res) => {
-  if (!ensureReady(req, res)) return;
-  try {
-    const { message } = req.body;
-    if (!message) return res.status(400).json({ error: "message is required" });
-    const result = await sock.sendMessage("status@broadcast", { text: message });
-    res.json({
-      success: true,
-      wa_message_id: result.key.id,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── LOGOUT ───
+// Logout (disconnect WhatsApp)
 app.post("/logout", async (req, res) => {
-  if (!ensureReady(req, res)) return;
+  if (!clientReady) return res.status(503).json({ error: "Client not ready" });
   try {
-    await sock.logout();
-    clientReady = false;
-    clientInfo = null;
-    contactStore = {};
-    groupCache = {};
+    await client.logout();
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -299,5 +322,5 @@ app.post("/logout", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WhatsApp Baileys server running on port ${PORT}`);
+  console.log(`WhatsApp server running on port ${PORT}`);
 });
