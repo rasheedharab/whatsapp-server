@@ -20,6 +20,39 @@ function auth(req, res, next) {
 }
 app.use(auth);
 
+// ─── Startup self-check ───
+app.get("/health", (req, res) => {
+  const checks = {
+    modules: {},
+    env: {},
+    client: {
+      ready: clientReady,
+      qrPending: !!qrData,
+    },
+  };
+
+  // Check required modules
+  const requiredModules = ["whatsapp-web.js", "qrcode", "express", "cors"];
+  for (const mod of requiredModules) {
+    try {
+      require.resolve(mod);
+      checks.modules[mod] = "ok";
+    } catch {
+      checks.modules[mod] = "MISSING — run: npm install " + mod;
+    }
+  }
+
+  // Check env vars
+  const envVars = ["PORT", "API_KEY", "SESSION_NAME", "WEBHOOK_URL"];
+  for (const v of envVars) {
+    checks.env[v] = process.env[v] ? "set" : "not set";
+  }
+
+  const hasMissing = Object.values(checks.modules).some((v) => v !== "ok");
+  res.status(hasMissing ? 500 : 200).json(checks);
+});
+
+
 // ─── Webhook helper ───
 async function sendWebhook(payload) {
   if (!WEBHOOK_URL) return;
